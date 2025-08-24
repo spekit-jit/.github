@@ -2,13 +2,13 @@ name: Generate /tools index
 
 on:
   push:
-    branches: [ main ]              # ← change if your default branch isn't main
+    branches: [ main ]
     paths:
       - "tools/**"
-  workflow_dispatch: {}             # lets you run it manually
+  workflow_dispatch: {}
 
 permissions:
-  contents: write                   # needed to commit index.html
+  contents: write
 
 jobs:
   build:
@@ -17,7 +17,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build tools/index.html (no heredocs, no Python)
+      - name: Build tools/index.html
         uses: actions/github-script@v7
         with:
           script: |
@@ -27,14 +27,13 @@ jobs:
             const root = 'tools';
             if (!fs.existsSync(root)) fs.mkdirSync(root, { recursive: true });
 
-            // list direct .html/.htm (exclude index.html)
             const entries = fs.readdirSync(root, { withFileTypes: true });
+
             const direct = entries
               .filter(e => e.isFile() && /\.html?$/i.test(e.name) && !/^index\.html?$/i.test(e.name))
               .map(e => e.name)
               .sort((a,b) => a.localeCompare(b));
 
-            // list subfolders with index.html/htm
             const subidx = entries
               .filter(e => e.isDirectory())
               .map(d => {
@@ -46,21 +45,13 @@ jobs:
               .sort((a,b) => a.localeCompare(b));
 
             const label = n => n.replace(/\.html?$/i,'');
-            const hue = str => {
-              let h = 2166136261 >>> 0;
-              for (const ch of str) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619) >>> 0; }
-              return h % 360;
-            };
-            const grad = k => {
-              const h = hue(k), h2 = (h + 24) % 360;
-              return `linear-gradient(180deg, hsl(${h} 75% 46%), hsl(${h2} 78% 44%))`;
-            };
-            const btn = (href, text, key) =>
-              `<a class="tool" href="${href}" target="_blank" rel="noopener" style="background:${grad(key)}">${text} ✨</a>`;
+            const hue = str => { let h=2166136261>>>0; for(const ch of str){ h^=ch.charCodeAt(0); h=Math.imul(h,16777619)>>>0 } return h%360; };
+            const grad = k => { const h=hue(k), h2=(h+24)%360; return `linear-gradient(180deg, hsl(${h} 75% 46%), hsl(${h2} 78% 44%))`; };
+            const btn = (href, text, key) => `<a class="tool" href="${href}" target="_blank" rel="noopener" style="background:${grad(key)}">${text} ✨</a>`;
 
             const buttons = [];
-            for (const f of direct)  buttons.push(btn(`/tools/${encodeURIComponent(f)}`, label(f), f));
-            for (const d of subidx)  buttons.push(btn(`/tools/${encodeURIComponent(d)}/`, d, d));
+            for (const f of direct) buttons.push(btn(`/tools/${encodeURIComponent(f)}`, label(f), f));
+            for (const d of subidx) buttons.push(btn(`/tools/${encodeURIComponent(d)}/`, d, d));
             buttons.sort((a,b) => a.localeCompare(b));
 
             const updated = new Date().toISOString().replace(/\.\d{3}Z$/,'Z');
