@@ -2,12 +2,12 @@ name: Generate /tools index
 
 on:
   push:
-    branches: [ main ]          # <-- change if your default branch is different
+    branches: [ main ]          # <-- change if your default branch isn't "main"
     paths:
       - 'tools/**'
   workflow_dispatch: {}
   schedule:
-    - cron: '0 * * * *'         # hourly safety refresh
+    - cron: '0 * * * *'         # hourly refresh
 
 jobs:
   build:
@@ -21,59 +21,125 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Show repo status
-        run: |
-          echo "Branch: $GITHUB_REF"
-          echo "PWD: $(pwd)"
-          git status
-          echo "---- tree ----"
-          ls -la
-          echo "---- tools/ ----"
-          mkdir -p tools
-          ls -la tools || true
-
-      - name: Build tools/index.html from current folder contents
-        id: build
+      - name: Detect tools directory (case-insensitive) and list files
+        id: detect
         shell: bash
         run: |
           set -euo pipefail
-          root="tools"
-          mkdir -p "$root"
 
-          # Collect .html/.htm directly in /tools (skip index.html itself)
-          mapfile -t FILES < <( \
-            find "$root" -maxdepth 1 -type f \( -iname '*.html' -o -iname '*.htm' \) \
-            ! -iname 'index.html' ! -iname 'index.htm' \
-            -printf '%f\n' | sort -f \
-          )
+          echo "Repository root:"
+          pwd
+          echo "Tree:"
+          ls -la
 
-          echo "Found ${#FILES[@]} HTML file(s) in /tools:"
-          printf ' - %s\n' "${FILES[@]:-<none>}"
+          # Find real tools dir case-insensitively: tools / Tools / TOOLS...
+          TOOLS_DIR=""
+          while IFS= read -r -d '' d; do
+            TOOLS_DIR="$d"; break
+          done < <(find . -maxdepth 1 -type d -iname "tools" -print0)
 
-          # Helper funcs (inline python for reliable escaping & color)
+          if [[ -z "${TOOLS_DIR}" ]]; then
+            echo "No 'tools' directory found at repo root (case-insensitive). Creating ./tools"
+            mkdir -p tools
+            TOOLS_DIR="tools"
+          else
+            TOOLS_DIR="${TOOLS_DIR#./}"   # strip leading './'
+          fi
+          echo "TOOLS_DIR=${TOOLS_DIR}" >> $GITHUB_OUTPUT
+          echo "Using tools dir: '${TOOLS_DIR}'"
+
+          echo "Directory listing (${TOOLS_DIR}):"
+          ls -la "${TOOLS_DIR}" || true
+
+          echo "Git tracked files under ${TOOLS_DIR}:"
+          git ls-files "${TOOLS_DIR}" || true
+
+          # Gather: (A) direct *.html/*.htm files; (B) one-level subfolders with index.html
+          mapfile -t DIRECT < <(find "${TOOLS_DIR}" -maxdepth 1 -type f \( -iname "*.html" -o -iname "*.htm" \) ! -iname "index.html" ! -iname "index.htm" -printf '%f\n' | sort -f)
+          mapfile -t SUBIDX  < <(find "${TOOLS_DIR}" -maxdepth 2 -mindepth 2 -type f \( -iname "index.html" -o -iname "index.htm" \) -printf '%P\n' | sort -f)
+
+          echo "Found ${#DIRECT[@]} direct HTML file(s):"
+          for f in "${DIRECT[@]}"; do echo " - ${f}"; done
+
+          echo "Found ${#SUBIDX[@]} subfolder index file(s):"
+          for p in "${SUBIDX[@]}"; do echo " - ${p}"; done
+
+          # Save lists to files for the next step
+          printf '%s\n' "${DIRECT[@]}" > /tmp/direct.txt || true
+          printf '%s\n' "${SUBIDX[@]}" > /tmp/subidx.txt || true
+
+      - name: Build tools/index.html
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOLS_DIR="${{ steps.detect.outputs.TOOLS_DIR }}"
+          mkdir -p "${TOOLS_DIR}"
+
+          # Read lists (may be empty)
+          mapfile -t DIRECT < /tmp/direct.txt || true
+          mapfile -t SUBIDX < /tmp/subidx.txt || true
+
           PYTHON3=$(command -v python3 || command -v python)
-          "$PYTHON3" - <<'PY' "${FILES[@]}"
+          "$PYTHON3" - <<'PY' "${TOOLS_DIR}" "${DIRECT[@]}" "::SEP::" "${SUBIDX[@]}"
 import sys, os, html, datetime
-files = sys.argv[1:]
+
+# Args: tools_dir, then direct files, then marker "::SEP::", then subidx paths
+args = sys.argv[1:]
+tools_dir = args[0]
+rest = args[1:]
+direct = []
+subidx = []
+if "::SEP::" in rest:
+    i = rest.index("::SEP::")
+    direct = rest[:i]
+    subidx  = rest[i+1:]
+else:
+    direct = rest
+
 updated = datetime.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
 
-def label(s):
+def label(name):
     for ext in (".html",".htm",".HTML",".HTM"):
-        if s.endswith(ext): return s[:-len(ext)]
-    return s
-def hue(name):
+        if name.endswith(ext): return name[:-len(ext)]
+    return name
+
+def hue(s):
     h = 2166136261
-    for ch in name:
+    for ch in s:
         h ^= ord(ch); h = (h * 16777619) & 0xffffffff
     return h % 360
-def gradient(name):
-    h = hue(name); h2 = (h + 24) % 360
+
+def gradient(key):
+    h = hue(key); h2 = (h + 24) % 360
     return f"linear-gradient(180deg, hsl({h} 75% 46%), hsl({h2} 78% 44%))"
 
+# Build button HTML
 buttons = []
-for f in files:
-    buttons.append(f'''<a class="tool" href="/tools/{html.escape(f,quote=True)}" target="_blank" rel="noopener"
-         style="background:{gradient(f)}">{html.escape(label(f))} ✨</a>''')
+
+# A) direct files: link /tools/<file>
+for f in direct:
+    href = f"/{tools_dir}/{html.escape(f, quote=True)}"
+    text = html.escape(label(f))
+    buttons.append(f'<a class="tool" href="{href}" target="_blank" rel="noopener" style="background:{gradient(f)}">{text} ✨</a>')
+
+# B) subfolder index: paths like "<folder>/index.html" -> link "/tools/<folder>/"
+for p in subidx:
+    folder = p.split('/', 1)[0]
+    href = f"/{tools_dir}/{html.escape(folder, quote=True)}/"
+    text = html.escape(folder)
+    buttons.append(f'<a class="tool" href="{href}" target="_blank" rel="noopener" style="background:{gradient(folder)}">{text} ✨</a>')
+
+# Sort by label, stable
+from bs4 import BeautifulSoup as BS  # fallback: avoid; but Actions runner has no bs4 by default. We'll skip sorting by parsed.
+# Simpler: sort using key extracted before building:
+def sort_key(btn_html):
+    # Extract label before the emoji (ends with ' ✨</a>')
+    try:
+        return btn_html.split('>')[2].rsplit(' ✨',1)[0].lower()
+    except:
+        return btn_html
+
+buttons.sort(key=sort_key)
 
 html_out = f"""<!DOCTYPE html>
 <html lang="en"><head>
@@ -105,28 +171,33 @@ a.tool:hover{{transform:translateY(-1px);box-shadow:0 14px 30px rgba(0,0,0,.30)}
     <div class="grid">
       {''.join(buttons)}
     </div>
-    <div class="tiny">Last updated: {html.escape(updated)} • {len(files)} file(s)</div>
+    <div class="tiny">Last updated: {html.escape(updated)} • {len(buttons)} link(s)</div>
   </div>
 </body></html>"""
-os.makedirs("tools", exist_ok=True)
-with open("tools/index.html", "w", encoding="utf-8") as f:
+
+out_path = os.path.join(tools_dir, "index.html")
+with open(out_path, "w", encoding="utf-8") as f:
     f.write(html_out)
-print(f"Wrote tools/index.html with {len(files)} entries at {updated}")
+print(f"Wrote {out_path} with {len(buttons)} entries at {updated}")
 PY
 
       - name: Upload generated index for preview
         uses: actions/upload-artifact@v4
         with:
           name: generated-tools-index
-          path: tools/index.html
+          path: "${{ steps.detect.outputs.TOOLS_DIR }}/index.html"
 
       - name: Commit index.html if changed
+        shell: bash
         run: |
-          if [[ -n "$(git status --porcelain tools/index.html)" ]]; then
+          set -e
+          TOOLS_DIR="${{ steps.detect.outputs.TOOLS_DIR }}"
+          if [[ -n "$(git status --porcelain "${TOOLS_DIR}/index.html")" ]]; then
             git config user.name  "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add tools/index.html
+            git add "${TOOLS_DIR}/index.html"
             git commit -m "build(tools): regenerate index.html"
             git push
           else
             echo "No changes to commit."
+          fi
