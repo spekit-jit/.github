@@ -1,8 +1,8 @@
-name: Build & Deploy Pages (tools)
+name: Build & Deploy Pages (auto labels)
 
 on:
-  push:                  # run on any push to this repo
-  workflow_dispatch: {}  # allow manual runs
+  push:                  # any push
+  workflow_dispatch: {}  # manual runs
 
 permissions:
   contents: read
@@ -16,6 +16,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      LABELS_URL: ${{ secrets.LABELS_URL }}   # optional: set to a public JSON URL to override labels
     steps:
       - uses: actions/checkout@v4
 
@@ -26,117 +28,117 @@ jobs:
           shopt -s dotglob
           cp -r * _site || true
 
-      - name: Generate root index.html (auto buttons + labels.json support)
+      - name: Generate root index.html (read labels from HTML + optional web JSON)
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             const path = require('path');
+            const https = require('https');
 
-            // Detect base path automatically:
-            // - user/org site repo ends with .github.io -> base = ''
-            // - project repo (e.g., 'tools')          -> base = '/<repo>'
+            // Detect base path automatically
             const repo = process.env.GITHUB_REPOSITORY.split('/')[1];
             const isUserSite = /\.github\.io$/i.test(repo);
             const base = isUserSite ? '' : `/${repo}`;
-
             const siteRoot = '_site';
 
-            // Load optional labels.json from repo root (already copied into _site)
-            const labelsPath = path.join(siteRoot, 'labels.json');
-            let labels = {};
-            if (fs.existsSync(labelsPath)) {
-              try {
-                const raw = JSON.parse(fs.readFileSync(labelsPath, 'utf8'));
-                // Normalize: allow string or object per key
-                for (const [k, v] of Object.entries(raw)) {
-                  if (typeof v === 'string') labels[k] = { label: v };
-                  else if (v && typeof v === 'object') {
-                    labels[k] = {
-                      label: v.label ?? '',
-                      emoji: v.emoji ?? '',
-                      color: v.color ?? ''   // optional hex or CSS color
-                    };
-                  }
-                }
-              } catch (e) {
-                console.warn('⚠️ labels.json parse error:', e.message);
-              }
-            }
+            // Utility: tiny HTML tag grabber (quick & robust enough for our metadata)
+            const readFile = p => fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
+            const pick = (html, regex) => {
+              const m = html.match(regex);
+              return m ? (m[1] || m[2] || '').trim() : '';
+            };
+            const extractMeta = (html) => ({
+              label: pick(html, /<meta\s+name=["']app-label["']\s+content=["']([^"']+)["']/i),
+              emoji: pick(html, /<meta\s+name=["']app-emoji["']\s+content=["']([^"']+)["']/i),
+              color: pick(html, /<meta\s+name=["']app-color["']\s+content=["']([^"']+)["']/i),
+              title: pick(html, /<title[^>]*>([^<]+)<\/title>/i),
+              h1:    pick(html, /<h1[^>]*>([^<]+)<\/h1>/i),
+            });
 
-            // Read entries at repo root inside artifact (this project repo publishes at /<repo>/)
+            // Optional internet-sourced override map (JSON)
+            // Format example:
+            // { "dealrooms.html": {"label":"Deal Room Builder","emoji":"💼","color":"#5E81F4"},
+            //   "my-app/index.html": {"label":"My App","emoji":"🧪"} }
+            const LABELS_URL = process.env.LABELS_URL || '';
+            const fetchJson = (url) => new Promise((resolve) => {
+              if (!url) return resolve({});
+              https.get(url, (res) => {
+                if (res.statusCode !== 200) return resolve({});
+                let data=''; res.on('data', d => data+=d);
+                res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({}); } });
+              }).on('error', () => resolve({}));
+            });
+
+            // Build listing of apps at repo root
             const entries = fs.readdirSync(siteRoot, { withFileTypes: true })
-              // ignore CI and non-content folders
-              .filter(e => !['.github','_site','node_modules','.git'].includes(e.name));
+              .filter(e => !['.github','_site','node_modules','.git','README.md'].includes(e.name));
 
-            // A) Direct .html files in root (exclude index.html)
-            const direct = entries
+            const directFiles = entries
               .filter(e => e.isFile() && /\.html?$/i.test(e.name) && !/^index\.html?$/i.test(e.name))
               .map(e => e.name);
 
-            // B) One-level subfolders that contain index.html/htm
-            const subidxDirs = entries
+            const subFolders = entries
               .filter(e => e.isDirectory())
-              .map(d => {
-                const p1 = path.join(siteRoot, d.name, 'index.html');
-                const p2 = path.join(siteRoot, d.name, 'index.htm');
-                return (fs.existsSync(p1) || fs.existsSync(p2)) ? d.name : null;
-              })
-              .filter(Boolean);
+              .filter(d => fs.existsSync(path.join(siteRoot, d.name, 'index.html')) || fs.existsSync(path.join(siteRoot, d.name, 'index.htm')))
+              .map(d => d.name);
 
-            // Visual helpers
             const stripExt = s => s.replace(/\.html?$/i,'');
-            const hue = s => { let h = 2166136261 >>> 0; for (const ch of s) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619) >>> 0 } return h % 360; };
-            const gradient = k => {
-              const h = hue(k), h2 = (h + 24) % 360;
-              return `linear-gradient(180deg, hsl(${h} 75% 46%), hsl(${h2} 78% 44%))`;
-            };
+            const hue = s => { let h = 2166136261>>>0; for (const ch of s) { h ^= ch.charCodeAt(0); h = Math.imul(h,16777619)>>>0 } return h%360; };
+            const gradient = k => { const h=hue(k), h2=(h+24)%360; return `linear-gradient(180deg, hsl(${h} 75% 46%), hsl(${h2} 78% 44%))`; };
 
-            // Build button HTML
-            const makeBtn = (href, key, display) => {
-              const meta = labels[key] || {};
-              const label = (meta.label || display || stripExt(key));
-              const emoji = meta.emoji ? ` ${meta.emoji}` : ' ✨';
-              const styleBg = meta.color ? `background:${meta.color}` : `background:${gradient(key)}`;
-              return `<a class="tool" href="${href}" target="_blank" rel="noopener" style="${styleBg}">${label}${emoji}</a>`;
-            };
+            (async () => {
+              const overrides = await fetchJson(LABELS_URL);
 
-            const buttons = [];
+              const buttons = [];
 
-            // Direct files → /<base>/<file>
-            for (const f of direct.sort((a,b)=>a.localeCompare(b))) {
-              buttons.push(makeBtn(`${base}/${encodeURIComponent(f)}`, f, stripExt(f)));
-            }
+              // A) Direct HTML files at root
+              for (const f of directFiles.sort((a,b)=>a.localeCompare(b))) {
+                const html = readFile(path.join(siteRoot, f));
+                const meta = extractMeta(html);
+                const ov  = overrides[f] || {};
+                const label = ov.label || meta.label || meta.title || meta.h1 || stripExt(f);
+                const emoji = (ov.emoji || meta.emoji || '✨').trim();
+                const color = (ov.color || meta.color || '').trim();
+                const bg = color ? `background:${color}` : `background:${gradient(f)}`;
+                buttons.push(`<a class="tool" href="${base}/${encodeURIComponent(f)}" target="_blank" rel="noopener" style="${bg}">${label} ${emoji}</a>`);
+              }
 
-            // Subfolder index → /<base>/<folder>/
-            for (const d of subidxDirs.sort((a,b)=>a.localeCompare(b))) {
-              const key = `${d}/index.html`; // allows labels.json to target folder buttons
-              buttons.push(makeBtn(`${base}/${encodeURIComponent(d)}/`, key, d));
-            }
+              // B) One-level subfolders with index.html
+              for (const d of subFolders.sort((a,b)=>a.localeCompare(b))) {
+                const key = `${d}/index.html`;
+                const html = readFile(path.join(siteRoot, d, 'index.html')) || readFile(path.join(siteRoot, d, 'index.htm'));
+                const meta = extractMeta(html);
+                const ov  = overrides[key] || {};
+                const label = ov.label || meta.label || meta.title || meta.h1 || d;
+                const emoji = (ov.emoji || meta.emoji || '✨').trim();
+                const color = (ov.color || meta.color || '').trim();
+                const bg = color ? `background:${color}` : `background:${gradient(d)}`;
+                buttons.push(`<a class="tool" href="${base}/${encodeURIComponent(d)}/" target="_blank" rel="noopener" style="${bg}">${label} ${emoji}</a>`);
+              }
 
-            const updated = new Date().toISOString().replace(/\.\d{3}Z$/,'Z');
-            const html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-            <title>tools</title><meta name="color-scheme" content="light dark">
-            <style>
-              :root{--bg:#0f1220;--panel:#14182a;--ink:#e9ecf8}
-              @media (prefers-color-scheme:light){:root{--bg:#f6f7fb;--panel:#fff;--ink:#0f1426}}
-              *{box-sizing:border-box}html,body{height:100%}
-              body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,system-ui,Segoe UI,Roboto;display:flex;justify-content:center}
-              .board{max-width:1000px;margin:16px;padding:16px;background:var(--panel);border-radius:14px;border:1px solid rgba(255,255,255,.08)}
-              .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
-              a.tool{display:flex;align-items:center;justify-content:center;padding:14px 12px;min-height:56px;border-radius:12px;color:#fff;text-decoration:none;font-weight:600;
-                     border:1px solid rgba(255,255,255,.12);box-shadow:0 10px 24px rgba(0,0,0,.25)}
-              a.tool:hover{transform:translateY(-1px)}
-              .tiny{margin-top:10px;font:12px/1.3 ui-monospace,monospace;color:#9aa3bf;text-align:center}
-            </style>
-            <div class="board">
-              <div class="grid">${buttons.join('')}</div>
-              <div class="tiny">Last updated: ${updated} • ${buttons.length} link(s)</div>
-            </div>`;
-
-            // Write index at site root so project site loads buttons at https://<user>.github.io/<repo>/
-            fs.writeFileSync(path.join(siteRoot, 'index.html'), html);
-            console.log(`Root index generated with ${buttons.length} button(s). Base path: '${base}'`);
+              const updated = new Date().toISOString().replace(/\.\d{3}Z$/,'Z');
+              const htmlOut = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+              <title>tools</title><meta name="color-scheme" content="light dark">
+              <style>
+                :root{--bg:#0f1220;--panel:#14182a;--ink:#e9ecf8}
+                @media (prefers-color-scheme:light){:root{--bg:#f6f7fb;--panel:#fff;--ink:#0f1426}}
+                *{box-sizing:border-box}html,body{height:100%}
+                body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,system-ui,Segoe UI,Roboto;display:flex;justify-content:center}
+                .board{max-width:1000px;margin:16px;padding:16px;background:var(--panel);border-radius:14px;border:1px solid rgba(255,255,255,.08)}
+                .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
+                a.tool{display:flex;align-items:center;justify-content:center;padding:14px 12px;min-height:56px;border-radius:12px;color:#fff;text-decoration:none;font-weight:600;
+                       border:1px solid rgba(255,255,255,.12);box-shadow:0 10px 24px rgba(0,0,0,.25)}
+                a.tool:hover{transform:translateY(-1px)}
+                .tiny{margin-top:10px;font:12px/1.3 ui-monospace,monospace;color:#9aa3bf;text-align:center}
+              </style>
+              <div class="board">
+                <div class="grid">${buttons.join('')}</div>
+                <div class="tiny">Last updated: ${updated} • ${buttons.length} link(s)</div>
+              </div>`;
+              fs.writeFileSync(path.join(siteRoot, 'index.html'), htmlOut);
+              console.log(`Generated ${buttons.length} buttons. Base: '${base}'. Overrides: ${LABELS_URL ? 'ON' : 'OFF'}`);
+            })();
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
