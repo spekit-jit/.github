@@ -1,0 +1,14 @@
+name: Trigger Build & Deploy Pages
+on:
+  schedule:
+    - cron: '0 0 * * *' # Daily at midnight UTC
+  workflow_dispatch:
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Workflow in Target Repository
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          gh workflow run build-deploy-pages.yml --repo OWNER/TARGET-REPO --ref main
