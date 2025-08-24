@@ -2,12 +2,12 @@ name: Generate /tools index
 
 on:
   push:
-    branches: [ main ]          # <-- change if your default branch isn't "main"
+    branches: [ main ]          # ← change if your default branch isn't main
     paths:
-      - 'tools/**'
+      - "tools/**"
   workflow_dispatch: {}
   schedule:
-    - cron: '0 * * * *'         # hourly refresh
+    - cron: "0 * * * *"         # hourly refresh
 
 jobs:
   build:
@@ -16,92 +16,70 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Detect tools directory (case-insensitive) and list files
-        id: detect
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Repository root:"
-          pwd
-          echo "Tree:"
-          ls -la
-
-          # Find real tools dir case-insensitively: tools / Tools / TOOLS...
-          TOOLS_DIR=""
-          while IFS= read -r -d '' d; do
-            TOOLS_DIR="$d"; break
-          done < <(find . -maxdepth 1 -type d -iname "tools" -print0)
-
-          if [[ -z "${TOOLS_DIR}" ]]; then
-            echo "No 'tools' directory found at repo root (case-insensitive). Creating ./tools"
-            mkdir -p tools
-            TOOLS_DIR="tools"
-          else
-            TOOLS_DIR="${TOOLS_DIR#./}"   # strip leading './'
-          fi
-          echo "TOOLS_DIR=${TOOLS_DIR}" >> $GITHUB_OUTPUT
-          echo "Using tools dir: '${TOOLS_DIR}'"
-
-          echo "Directory listing (${TOOLS_DIR}):"
-          ls -la "${TOOLS_DIR}" || true
-
-          echo "Git tracked files under ${TOOLS_DIR}:"
-          git ls-files "${TOOLS_DIR}" || true
-
-          # Gather: (A) direct *.html/*.htm files; (B) one-level subfolders with index.html
-          mapfile -t DIRECT < <(find "${TOOLS_DIR}" -maxdepth 1 -type f \( -iname "*.html" -o -iname "*.htm" \) ! -iname "index.html" ! -iname "index.htm" -printf '%f\n' | sort -f)
-          mapfile -t SUBIDX  < <(find "${TOOLS_DIR}" -maxdepth 2 -mindepth 2 -type f \( -iname "index.html" -o -iname "index.htm" \) -printf '%P\n' | sort -f)
-
-          echo "Found ${#DIRECT[@]} direct HTML file(s):"
-          for f in "${DIRECT[@]}"; do echo " - ${f}"; done
-
-          echo "Found ${#SUBIDX[@]} subfolder index file(s):"
-          for p in "${SUBIDX[@]}"; do echo " - ${p}"; done
-
-          # Save lists to files for the next step
-          printf '%s\n' "${DIRECT[@]}" > /tmp/direct.txt || true
-          printf '%s\n' "${SUBIDX[@]}" > /tmp/subidx.txt || true
 
       - name: Build tools/index.html
         shell: bash
         run: |
           set -euo pipefail
-          TOOLS_DIR="${{ steps.detect.outputs.TOOLS_DIR }}"
-          mkdir -p "${TOOLS_DIR}"
 
-          # Read lists (may be empty)
-          mapfile -t DIRECT < /tmp/direct.txt || true
-          mapfile -t SUBIDX < /tmp/subidx.txt || true
+          TOOLS_DIR="tools"
+          mkdir -p "$TOOLS_DIR"
 
-          PYTHON3=$(command -v python3 || command -v python)
-          "$PYTHON3" - <<'PY' "${TOOLS_DIR}" "${DIRECT[@]}" "::SEP::" "${SUBIDX[@]}"
-import sys, os, html, datetime
+          # Collect direct .html/.htm files (excluding index.html)
+          mapfile -t DIRECT < <( \
+            find "$TOOLS_DIR" -maxdepth 1 -type f \( -iname "*.html" -o -iname "*.htm" \) \
+              ! -iname "index.html" ! -iname "index.htm" \
+              -printf "%f\n" | sort -f \
+          )
 
-# Args: tools_dir, then direct files, then marker "::SEP::", then subidx paths
-args = sys.argv[1:]
-tools_dir = args[0]
-rest = args[1:]
+          # Collect one-level subfolders that have index.html
+          mapfile -t SUBIDX < <( \
+            find "$TOOLS_DIR" -maxdepth 2 -mindepth 2 -type f \( -iname "index.html" -o -iname "index.htm" \) \
+              -printf "%P\n" | sort -f \
+          )
+
+          echo "Direct HTML files (${#DIRECT[@]}):"
+          printf ' - %s\n' "${DIRECT[@]}" || true
+          echo "Subfolder index files (${#SUBIDX[@]}):"
+          printf ' - %s\n' "${SUBIDX[@]}" || true
+
+          python3 - <<'PY'
+import os, html, datetime, json
+
+tools_dir = "tools"
+
+# Load lists written by the shell step
+def read_list(path):
+    if not os.path.exists(path): return []
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+direct = read_list("/home/runner/work/" + os.environ["GITHUB_REPOSITORY"].split("/")[1] + "/tools/direct.txt") if False else []  # placeholder
+
+# Re-scan here in Python (portable across runners)
 direct = []
+for name in sorted(os.listdir(tools_dir), key=str.lower):
+    low = name.lower()
+    if low.endswith((".html", ".htm")) and low not in ("index.html", "index.htm"):
+        direct.append(name)
+
 subidx = []
-if "::SEP::" in rest:
-    i = rest.index("::SEP::")
-    direct = rest[:i]
-    subidx  = rest[i+1:]
-else:
-    direct = rest
+for name in sorted(os.listdir(tools_dir), key=str.lower):
+    p = os.path.join(tools_dir, name, "index.html")
+    q = os.path.join(tools_dir, name, "index.htm")
+    if os.path.isdir(os.path.join(tools_dir, name)) and (os.path.exists(p) or os.path.exists(q)):
+        subidx.append(name + "/index.html")  # keep a consistent marker
 
-updated = datetime.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
+updated = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-def label(name):
+def label(n):
     for ext in (".html",".htm",".HTML",".HTM"):
-        if name.endswith(ext): return name[:-len(ext)]
-    return name
+        if n.endswith(ext): return n[:-len(ext)]
+    return n
 
 def hue(s):
     h = 2166136261
@@ -113,59 +91,55 @@ def gradient(key):
     h = hue(key); h2 = (h + 24) % 360
     return f"linear-gradient(180deg, hsl({h} 75% 46%), hsl({h2} 78% 44%))"
 
-# Build button HTML
 buttons = []
-
-# A) direct files: link /tools/<file>
+# Direct files → /tools/<file>
 for f in direct:
-    href = f"/{tools_dir}/{html.escape(f, quote=True)}"
+    href = f"/tools/{html.escape(f, quote=True)}"
     text = html.escape(label(f))
     buttons.append(f'<a class="tool" href="{href}" target="_blank" rel="noopener" style="background:{gradient(f)}">{text} ✨</a>')
 
-# B) subfolder index: paths like "<folder>/index.html" -> link "/tools/<folder>/"
-for p in subidx:
-    folder = p.split('/', 1)[0]
-    href = f"/{tools_dir}/{html.escape(folder, quote=True)}/"
+# Subfolder index → /tools/<folder>/
+for entry in subidx:
+    folder = entry.split("/", 1)[0]
+    href = f"/tools/{html.escape(folder, quote=True)}/"
     text = html.escape(folder)
     buttons.append(f'<a class="tool" href="{href}" target="_blank" rel="noopener" style="background:{gradient(folder)}">{text} ✨</a>')
 
-# Sort by label, stable
-from bs4 import BeautifulSoup as BS  # fallback: avoid; but Actions runner has no bs4 by default. We'll skip sorting by parsed.
-# Simpler: sort using key extracted before building:
-def sort_key(btn_html):
-    # Extract label before the emoji (ends with ' ✨</a>')
+# Sort by visible label
+def sort_key(btn):
     try:
-        return btn_html.split('>')[2].rsplit(' ✨',1)[0].lower()
+        return btn.split(">")[2].rsplit(" ✨", 1)[0].lower()
     except:
-        return btn_html
-
+        return btn
 buttons.sort(key=sort_key)
+
+base_css = """
+:root{ --bg:#0f1220; --panel:#14182a; --ink:#e9ecf8; --shadow:0 16px 40px rgba(0,0,0,.38) }
+@media (prefers-color-scheme: light){ :root{ --bg:#f6f7fb; --panel:#fff; --ink:#0f1426; --shadow:0 18px 40px rgba(12,24,60,.08) } }
+*{box-sizing:border-box} html,body{height:100%}
+body{margin:0;color:var(--ink);font-family:-apple-system,system-ui,Segoe UI,Roboto,Helvetica,Arial,Apple Color Emoji,Segoe UI Emoji;
+     background:radial-gradient(1200px 520px at 0% -10%, rgba(110,86,207,.25), transparent 60%),
+                radial-gradient(900px 360px at 110% 0%, rgba(69,231,179,.20), transparent 60%),var(--bg);
+     display:flex;align-items:stretch;justify-content:center}
+.board{width:100%;max-width:1100px;margin:16px;padding:16px;background:var(--panel);
+       border:1px solid rgba(255,255,255,.08);border-radius:18px;box-shadow:var(--shadow)}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
+@media (max-width:980px){.grid{grid-template-columns:repeat(8,1fr)}}
+@media (max-width:640px){.grid{grid-template-columns:repeat(2,1fr)}}
+a.tool{grid-column:span 3;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;text-align:center;
+       padding:14px 12px;min-height:56px;border-radius:14px;color:#fff;font-weight:700;letter-spacing:.2px;
+       border:1px solid rgba(255,255,255,.12);box-shadow:0 12px 26px rgba(0,0,0,.25);
+       transition:transform .06s,box-shadow .12s;word-break:break-word;backdrop-filter:saturate(110%)}
+@media (max-width:980px){a.tool{grid-column:span 4}} @media (max-width:640px){a.tool{grid-column:span 2}}
+a.tool:hover{transform:translateY(-1px);box-shadow:0 14px 30px rgba(0,0,0,.30)}
+.tiny{margin-top:10px;font:12px/1.3 ui-monospace,monospace;color:#9aa3bf;text-align:center;opacity:.85}
+"""
 
 html_out = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
 <meta name="color-scheme" content="light dark" /><title>tools</title>
-<style>
-:root{{ --bg:#0f1220; --panel:#14182a; --ink:#e9ecf8; --shadow:0 16px 40px rgba(0,0,0,.38) }}
-@media (prefers-color-scheme: light){{ :root{{ --bg:#f6f7fb; --panel:#fff; --ink:#0f1426; --shadow:0 18px 40px rgba(12,24,60,.08) }} }}
-*{{box-sizing:border-box}} html,body{{height:100%}}
-body{{margin:0;color:var(--ink);font-family:-apple-system,system-ui,Segoe UI,Roboto,Helvetica,Arial,Apple Color Emoji,Segoe UI Emoji;
-     background:radial-gradient(1200px 520px at 0% -10%, rgba(110,86,207,.25), transparent 60%),
-                radial-gradient(900px 360px at 110% 0%, rgba(69,231,179,.20), transparent 60%),var(--bg);
-     display:flex;align-items:stretch;justify-content:center}}
-.board{{width:100%;max-width:1100px;margin:16px;padding:16px;background:var(--panel);
-       border:1px solid rgba(255,255,255,.08);border-radius:18px;box-shadow:var(--shadow)}}
-.grid{{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}}
-@media (max-width:980px){{.grid{{grid-template-columns:repeat(8,1fr)}}}}
-@media (max-width:640px){{.grid{{grid-template-columns:repeat(2,1fr)}}}}
-a.tool{{grid-column:span 3;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;text-align:center;
-       padding:14px 12px;min-height:56px;border-radius:14px;color:#fff;font-weight:700;letter-spacing:.2px;
-       border:1px solid rgba(255,255,255,.12);box-shadow:0 12px 26px rgba(0,0,0,.25);
-       transition:transform .06s,box-shadow .12s;word-break:break-word;backdrop-filter:saturate(110%)}}
-@media (max-width:980px){{a.tool{{grid-column:span 4}}}} @media (max-width:640px){{a.tool{{grid-column:span 2}}}}
-a.tool:hover{{transform:translateY(-1px);box-shadow:0 14px 30px rgba(0,0,0,.30)}}
-.tiny{{margin-top:10px;font:12px/1.3 ui-monospace,monospace;color:#9aa3bf;text-align:center;opacity:.85}}
-</style></head>
+<style>{base_css}</style></head>
 <body>
   <div class="board">
     <div class="grid">
@@ -175,27 +149,21 @@ a.tool:hover{{transform:translateY(-1px);box-shadow:0 14px 30px rgba(0,0,0,.30)}
   </div>
 </body></html>"""
 
-out_path = os.path.join(tools_dir, "index.html")
-with open(out_path, "w", encoding="utf-8") as f:
+os.makedirs(tools_dir, exist_ok=True)
+with open(os.path.join(tools_dir, "index.html"), "w", encoding="utf-8") as f:
     f.write(html_out)
-print(f"Wrote {out_path} with {len(buttons)} entries at {updated}")
-PY
 
-      - name: Upload generated index for preview
-        uses: actions/upload-artifact@v4
-        with:
-          name: generated-tools-index
-          path: "${{ steps.detect.outputs.TOOLS_DIR }}/index.html"
+print(f"Wrote {os.path.join(tools_dir, 'index.html')} with {len(buttons)} links at {updated}")
+PY
 
       - name: Commit index.html if changed
         shell: bash
         run: |
-          set -e
-          TOOLS_DIR="${{ steps.detect.outputs.TOOLS_DIR }}"
-          if [[ -n "$(git status --porcelain "${TOOLS_DIR}/index.html")" ]]; then
+          set -euo pipefail
+          if [[ -n "$(git status --porcelain tools/index.html)" ]]; then
             git config user.name  "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add "${TOOLS_DIR}/index.html"
+            git add tools/index.html
             git commit -m "build(tools): regenerate index.html"
             git push
           else
