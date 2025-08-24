@@ -1,4 +1,4 @@
-name: Build & Deploy Pages (auto labels, awaited)
+name: Build & Deploy Pages (auto labels, fixed)
 
 on:
   push:
@@ -17,18 +17,18 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      LABELS_URL: ${{ secrets.LABELS_URL }}   # optional public JSON
+      LABELS_URL: ${{ secrets.LABELS_URL }}   # optional override JSON
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prepare _site (copy repo)
+      - name: Prepare _site
         run: |
           rm -rf _site
           mkdir -p _site
           shopt -s dotglob
           cp -r * _site || true
 
-      - name: Generate root index.html (awaited, robust extraction)
+      - name: Generate index.html with auto labels
         uses: actions/github-script@v7
         with:
           script: |
@@ -36,140 +36,116 @@ jobs:
             const path = require('path');
             const https = require('https');
 
-            // Wrap everything in an awaited main()
-            module.exports = async ({ core }) => {
-              const repo = process.env.GITHUB_REPOSITORY.split('/')[1];
-              const isUserSite = /\.github\.io$/i.test(repo);
-              const base = isUserSite ? '' : `/${repo}`;
-              const siteRoot = '_site';
-
-              const LABELS_URL = process.env.LABELS_URL || '';
-
-              const read = p => fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
-              const fetchJson = (url) => new Promise((resolve) => {
-                if (!url) return resolve({});
-                try {
-                  https.get(url, (res) => {
-                    if (res.statusCode !== 200) return resolve({});
-                    let data=''; res.on('data', d => data+=d);
-                    res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({}); } });
-                  }).on('error', () => resolve({}));
-                } catch { resolve({}); }
+            async function fetchJson(url) {
+              if (!url) return {};
+              return new Promise((resolve) => {
+                https.get(url, (res) => {
+                  if (res.statusCode !== 200) return resolve({});
+                  let data = '';
+                  res.on('data', (d) => (data += d));
+                  res.on('end', () => {
+                    try { resolve(JSON.parse(data)); } catch { resolve({}); }
+                  });
+                }).on('error', () => resolve({}));
               });
+            }
 
-              // Tiny extractor helpers (case-insensitive)
-              const pick = (html, regexes) => {
-                for (const rx of regexes) {
-                  const m = html.match(rx);
-                  if (m) return (m[1] || m[2] || '').trim();
-                }
-                return '';
-              };
+            const repo = process.env.GITHUB_REPOSITORY.split('/')[1];
+            const isUserSite = /\.github\.io$/i.test(repo);
+            const base = isUserSite ? '' : `/${repo}`;
+            const siteRoot = '_site';
 
-              const extractMeta = (html) => {
-                return {
-                  label: pick(html, [
-                    /<meta\s+name=["']app-label["']\s+content=["']([^"']+)["']/i,
-                    /<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i
-                  ]),
-                  emoji: pick(html, [
-                    /<meta\s+name=["']app-emoji["']\s+content=["']([^"']+)["']/i
-                  ]),
-                  color: pick(html, [
-                    /<meta\s+name=["']app-color["']\s+content=["']([^"']+)["']/i
-                  ]),
-                  title: pick(html, [/<title[^>]*>([^<]+)<\/title>/i]),
-                  h1:    pick(html, [/<h1[^>]*>([^<]+)<\/h1>/i]),
-                };
-              };
+            const LABELS_URL = process.env.LABELS_URL || '';
+            const overrides = await fetchJson(LABELS_URL);
 
-              // Build list from root of artifact
-              const ignore = new Set(['.github','_site','node_modules','.git','README.md']);
-              const entries = fs.readdirSync(siteRoot, { withFileTypes: true })
-                .filter(e => !ignore.has(e.name));
-
-              const directFiles = entries
-                .filter(e => e.isFile() && /\.html?$/i.test(e.name) && !/^index\.html?$/i.test(e.name))
-                .map(e => e.name)
-                .sort((a,b)=>a.localeCompare(b));
-
-              const subFolders = entries
-                .filter(e => e.isDirectory())
-                .filter(d => fs.existsSync(path.join(siteRoot,d.name,'index.html')) || fs.existsSync(path.join(siteRoot,d.name,'index.htm')))
-                .map(d => d.name)
-                .sort((a,b)=>a.localeCompare(b));
-
-              const stripExt = s => s.replace(/\.html?$/i,'');
-              const hue = s => { let h=2166136261>>>0; for (const ch of s) { h ^= ch.charCodeAt(0); h = Math.imul(h,16777619)>>>0 } return h%360; };
-              const gradient = k => { const h=hue(k), h2=(h+24)%360; return `linear-gradient(180deg, hsl(${h} 75% 46%), hsl(${h2} 78% 44%))`; };
-
-              const overrides = await fetchJson(LABELS_URL);
-
-              const chooseLabel = (key, meta) => {
-                const ov = overrides[key] || {};
-                return (ov.label || meta.label || meta.title || meta.h1 || stripExt(key));
-              };
-              const chooseEmoji = (key, meta) => {
-                const ov = overrides[key] || {};
-                return (ov.emoji || meta.emoji || '✨').trim();
-              };
-              const chooseBg = (key, meta) => {
-                const ov = overrides[key] || {};
-                const color = (ov.color || meta.color || '').trim();
-                return color ? `background:${color}` : `background:${gradient(key)}`;
-              };
-
-              const logs = [];
-              const buttons = [];
-
-              // A) Files at root
-              for (const f of directFiles) {
-                const html = read(path.join(siteRoot, f));
-                const meta = extractMeta(html);
-                const label = chooseLabel(f, meta);
-                const emoji = chooseEmoji(f, meta);
-                const bg    = chooseBg(f, meta);
-                buttons.push(`<a class="tool" href="${base}/${encodeURIComponent(f)}" target="_blank" rel="noopener" style="${bg}">${label} ${emoji}</a>`);
-                logs.push(`file:${f} → label="${label}" emoji="${emoji}"`);
+            const read = (p) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '');
+            const pick = (html, regexes) => {
+              for (const rx of regexes) {
+                const m = html.match(rx);
+                if (m) return (m[1] || m[2] || '').trim();
               }
-
-              // B) Subfolder index
-              for (const d of subFolders) {
-                const key = `${d}/index.html`;
-                const html = read(path.join(siteRoot, d, 'index.html')) || read(path.join(siteRoot, d, 'index.htm'));
-                const meta = extractMeta(html);
-                const label = chooseLabel(key, meta);
-                const emoji = chooseEmoji(key, meta);
-                const bg    = chooseBg(key, meta);
-                buttons.push(`<a class="tool" href="${base}/${encodeURIComponent(d)}/" target="_blank" rel="noopener" style="${bg}">${label} ${emoji}</a>`);
-                logs.push(`dir:${d} → label="${label}" emoji="${emoji}"`);
-              }
-
-              logs.forEach(l => core.info(l));
-
-              const updated = new Date().toISOString().replace(/\.\d{3}Z$/,'Z');
-              const out = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-              <title>tools</title><meta name="color-scheme" content="light dark">
-              <style>
-                :root{--bg:#0f1220;--panel:#14182a;--ink:#e9ecf8}
-                @media (prefers-color-scheme:light){:root{--bg:#f6f7fb;--panel:#fff;--ink:#0f1426}}
-                *{box-sizing:border-box}html,body{height:100%}
-                body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,system-ui,Segoe UI,Roboto;display:flex;justify-content:center}
-                .board{max-width:1000px;margin:16px;padding:16px;background:var(--panel);border-radius:14px;border:1px solid rgba(255,255,255,.08)}
-                .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
-                a.tool{display:flex;align-items:center;justify-content:center;padding:14px 12px;min-height:56px;border-radius:12px;color:#fff;text-decoration:none;font-weight:600;
-                       border:1px solid rgba(255,255,255,.12);box-shadow:0 10px 24px rgba(0,0,0,.25)}
-                a.tool:hover{transform:translateY(-1px)}
-                .tiny{margin-top:10px;font:12px/1.3 ui-monospace,monospace;color:#9aa3bf;text-align:center}
-              </style>
-              <div class="board">
-                <div class="grid">${buttons.join('')}</div>
-                <div class="tiny">Last updated: ${updated} • ${buttons.length} link(s)</div>
-              </div>`;
-              fs.writeFileSync(path.join(siteRoot, 'index.html'), out);
-              core.info(`Generated ${buttons.length} buttons. Base='${base}'. Overrides=${LABELS_URL ? 'ON' : 'OFF'}`);
+              return '';
             };
 
+            const extractMeta = (html) => ({
+              label: pick(html, [
+                /<meta\s+name=["']app-label["']\s+content=["']([^"']+)["']/i,
+                /<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i,
+              ]),
+              emoji: pick(html, [
+                /<meta\s+name=["']app-emoji["']\s+content=["']([^"']+)["']/i,
+              ]),
+              color: pick(html, [
+                /<meta\s+name=["']app-color["']\s+content=["']([^"']+)["']/i,
+              ]),
+              title: pick(html, [/<title[^>]*>([^<]+)<\/title>/i]),
+              h1: pick(html, [/<h1[^>]*>([^<]+)<\/h1>/i]),
+            });
+
+            const ignore = new Set(['.github', '_site', 'node_modules', '.git', 'README.md']);
+            const entries = fs.readdirSync(siteRoot, { withFileTypes: true }).filter(e => !ignore.has(e.name));
+
+            const directFiles = entries
+              .filter(e => e.isFile() && /\.html?$/i.test(e.name) && !/^index\.html?$/i.test(e.name))
+              .map(e => e.name)
+              .sort();
+
+            const subFolders = entries
+              .filter(e => e.isDirectory())
+              .filter(d => fs.existsSync(path.join(siteRoot, d.name, 'index.html')) || fs.existsSync(path.join(siteRoot, d.name, 'index.htm')))
+              .map(d => d.name)
+              .sort();
+
+            const stripExt = (s) => s.replace(/\.html?$/i, '');
+            const hue = (s) => { let h = 2166136261 >>> 0; for (const ch of s) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619) >>> 0; } return h % 360; };
+            const gradient = (k) => { const h = hue(k), h2 = (h + 24) % 360; return `linear-gradient(180deg,hsl(${h} 75% 46%),hsl(${h2} 78% 44%))`; };
+
+            const buttons = [];
+
+            function buildButton(key, href, html) {
+              const meta = extractMeta(html);
+              const ov = overrides[key] || {};
+              const label = ov.label || meta.label || meta.title || meta.h1 || stripExt(key);
+              const emoji = (ov.emoji || meta.emoji || '✨').trim();
+              const color = (ov.color || meta.color || '').trim();
+              const bg = color ? `background:${color}` : `background:${gradient(key)}`;
+              core.info(`${key} → "${label}" ${emoji}`);
+              return `<a class="tool" href="${href}" target="_blank" rel="noopener" style="${bg}">${label} ${emoji}</a>`;
+            }
+
+            for (const f of directFiles) {
+              const html = read(path.join(siteRoot, f));
+              buttons.push(buildButton(f, `${base}/${encodeURIComponent(f)}`, html));
+            }
+
+            for (const d of subFolders) {
+              const key = `${d}/index.html`;
+              const html = read(path.join(siteRoot, d, 'index.html')) || read(path.join(siteRoot, d, 'index.htm'));
+              buttons.push(buildButton(key, `${base}/${encodeURIComponent(d)}/`, html));
+            }
+
+            const updated = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+            const out = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+            <title>tools</title><meta name="color-scheme" content="light dark">
+            <style>
+              :root{--bg:#0f1220;--panel:#14182a;--ink:#e9ecf8}
+              @media (prefers-color-scheme:light){:root{--bg:#f6f7fb;--panel:#fff;--ink:#0f1426}}
+              *{box-sizing:border-box}html,body{height:100%}
+              body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,system-ui,Segoe UI,Roboto;display:flex;justify-content:center}
+              .board{max-width:1000px;margin:16px;padding:16px;background:var(--panel);border-radius:14px;border:1px solid rgba(255,255,255,.08)}
+              .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
+              a.tool{display:flex;align-items:center;justify-content:center;padding:14px 12px;min-height:56px;border-radius:12px;color:#fff;text-decoration:none;font-weight:600;
+                     border:1px solid rgba(255,255,255,.12);box-shadow:0 10px 24px rgba(0,0,0,.25)}
+              a.tool:hover{transform:translateY(-1px)}
+              .tiny{margin-top:10px;font:12px/1.3 ui-monospace,monospace;color:#9aa3bf;text-align:center}
+            </style>
+            <div class="board">
+              <div class="grid">${buttons.join('')}</div>
+              <div class="tiny">Last updated: ${updated} • ${buttons.length} link(s)</div>
+            </div>`;
+            fs.writeFileSync(path.join(siteRoot, 'index.html'), out);
+            core.info(`Generated ${buttons.length} buttons.`);
+      
       - name: Configure Pages
         uses: actions/configure-pages@v5
 
